@@ -1,34 +1,63 @@
-using System.Net.NetworkInformation;
+using Unity.VisualScripting;
 using UnityEngine;
+using UnityEngine.Animations.Rigging;
 using UnityEngine.InputSystem;
+using static UnityEditor.ShaderGraph.Internal.KeywordDependentCollection;
+using static UnityEngine.GraphicsBuffer;
 
 public class PlayerController : MonoBehaviour
 {
-    public bool CanMoveBody = true, CanMoveCamera = true, CanMoveObjects = true;
+    [Tooltip("Enable/disable movement")]
+    public bool CanMoveBody = true;
 
+    [Tooltip("Enable/disable camera rotation")]
+    public bool CanMoveCamera = true;
+
+    [Tooltip("Enable/disable Moving objects")]
+    public bool CanMoveObjects = true;
+
+    [Tooltip("Enable/disable Mantling")]
+    public bool CanMantle = true;
     
+
+    // Camera movement
+    [SerializeField] private Camera camera;
     [SerializeField] private float lookSensitivity = 1f;
+    private Vector2 lookInput;
+    private float camPitch = 0f, camYaw = 0f;
+    private float minCamYaw = -80;
+    
+    // movement values
     [SerializeField] private float movSpeed = 5f;
     [SerializeField] private float gravityModifier = -5f;
     [SerializeField] private float maxFallingSpeed = 10f;
-    [SerializeField] private float objectMovingStrenght = 2f;
-    [SerializeField] private Camera camera;
-    [SerializeField] private GameObject crosshairImageObject, objectMoverReferancePointObject;
-    [SerializeField] private LayerMask interactableLayerMask;
-    [SerializeField] private float interactDistance = 5f;
-
     private CharacterController controller;
-    private Vector2 moveInput, lookInput;
+    private Vector2 moveInput;
     private Vector3 velocity;
-    private float camPitch = 0f, camYaw = 0f;
-    
+    private bool isFalling = false;
 
     // used for object movement
+    [SerializeField] private float objectMovingStrenght = 2f;
+    [SerializeField] private GameObject crosshairImageObject, objectMoverReferancePointObject, cameraPivotBaseObject;
+    [SerializeField] private LayerMask interactableLayerMask;
+    [SerializeField] private float interactDistance = 5f;
     private bool isLookingAtInteractable = false, isMovingInteractable = false, clickHeld = false;
     private GameObject objectBeingLookedAt;
     private Rigidbody movingObjectRB;
     private InteractableObjectStatistics objectStats;
 
+    // Variables for Mantling
+    [SerializeField] private float mantleSpeed = 2f;
+    private float mantleCompletionValue;
+    private bool isMantling = false, handsInPosition = false;
+    private Vector3 startingPosWhenMantling;
+    private GameObject mantleAreaObject;
+    private MantleAreaController mantleAreaController;
+
+    // to move the arms
+    [SerializeField] private GameObject leftHandTarget, rightHandTarget, leftHandObject, rightHandObject;
+    [SerializeField] private TwoBoneIKConstraint leftHandIK, rightHandIK;
+    
 
     // editor variables 
     private bool cursorLocked;
@@ -53,8 +82,12 @@ public class PlayerController : MonoBehaviour
     {
         if (CanMoveBody) { PerformMovement(); }
         if (CanMoveCamera) { RotateCamera(); }
+
         if (CanMoveObjects) { MoveObjectBasedOnInput(); }
-        else { if(crosshairImageObject.activeInHierarchy) crosshairImageObject.SetActive(false); } 
+        else { if (crosshairImageObject.activeInHierarchy) crosshairImageObject.SetActive(false); }
+
+        if (CanMantle && !isFalling) { PerformMantleAction(); }
+        
 
     }
 
@@ -65,6 +98,7 @@ public class PlayerController : MonoBehaviour
         {
             if(movingObjectRB != null)
             {
+                isMovingInteractable = true;
                 Vector3 dir = objectMoverReferancePointObject.transform.position - movingObjectRB.transform.position;
                 dir = dir.normalized;
                 float distanceFactor = Vector3.Distance(objectMoverReferancePointObject.transform.position, movingObjectRB.transform.position);
@@ -146,11 +180,10 @@ public class PlayerController : MonoBehaviour
         // Pitch (camera up/down)
         camPitch -= mouseY;
         camYaw -= mouseX;
-        camPitch = Mathf.Clamp(camPitch, -80f, 80f);
+        camPitch = Mathf.Clamp(camPitch, minCamYaw, 80f);
 
-        camera.transform.localRotation = Quaternion.Euler(camPitch, -camYaw, 0f);
+        cameraPivotBaseObject.transform.localRotation = Quaternion.Euler(camPitch, -camYaw, 0f);
     }
-
 
     private void PerformMovement()
     {
@@ -175,11 +208,15 @@ public class PlayerController : MonoBehaviour
         controller.Move(velocity * Time.deltaTime);
     }
 
+
+
+    #region Getting Inputs
     public void ToggleCamera(InputAction.CallbackContext context)
     {
+        // if the UlockMouse input is registered, DEFAULT 'L' key
         if (Application.isEditor)
         {
-            if(cursorLocked)
+            if (cursorLocked)
             {
                 Cursor.lockState = CursorLockMode.None;
                 Cursor.visible = true;
@@ -198,10 +235,12 @@ public class PlayerController : MonoBehaviour
 
     public void OnLook(InputAction.CallbackContext context)
     {
+        // if the Look input is registered, DEFAULT 'Mouse Movement' 
         lookInput = context.ReadValue<Vector2>();
     }
     public void OnMove(InputAction.CallbackContext context)
     {
+        // if the Move input is registered, DEFAULT 'WASD' key(s)
         moveInput = context.ReadValue<Vector2>();
     }
     public void OnInteract(InputAction.CallbackContext context)
@@ -209,8 +248,14 @@ public class PlayerController : MonoBehaviour
         // if the interact input is registered, DEFAULT 'E' key
 
     }
+
+    public void OnJump(InputAction.CallbackContext context)
+    {
+        // if the Jump input is registered, DEFAULT 'SPACE' key
+    }
     public void OnClick(InputAction.CallbackContext context)
     {
+        // if the Attack input is registered, DEFAULT 'LMB' key
         onMouseClick();
         if(context.performed)
         {
@@ -220,6 +265,7 @@ public class PlayerController : MonoBehaviour
         if(context.canceled)
         {
             movingObjectRB = null;
+            isMovingInteractable = false;
             clickHeld = false;
         }
     }
@@ -235,4 +281,139 @@ public class PlayerController : MonoBehaviour
             }
         }
     }
+    #endregion
+
+    private void PerformMantleAction()
+    {
+        if(mantleAreaObject == null) { return; }
+
+        Vector3 dirToLedge = (mantleAreaController.LedgeObject.transform.position - transform.position).normalized;
+        float dotValue = Vector3.Dot(cameraPivotBaseObject.transform.right, dirToLedge);
+
+        leftHandTarget.transform.position = mantleAreaController.GrabLeftLocationObject.transform.position;
+        leftHandTarget.transform.rotation = mantleAreaController.GrabLeftLocationObject.transform.rotation;
+
+        rightHandTarget.transform.position = mantleAreaController.GrabRightLocationObject.transform.position;
+        rightHandTarget.transform.rotation = mantleAreaController.GrabRightLocationObject.transform.rotation;
+
+        if (!handsInPosition)
+        {
+            float distanceToWallFactor = Mathf.Clamp01(Vector3.Distance(transform.position, mantleAreaObject.transform.position));
+
+            float right = Mathf.Clamp01((dotValue + 1f) * 0.5f);
+            float left = Mathf.Clamp01((1f - dotValue) * 0.5f);
+
+            float leftOut = Mathf.Clamp01((1f - right) * 2f * (1f - distanceToWallFactor * 1.3f));
+            float rightOut = Mathf.Clamp01((1f - left) * 2f * (1f - distanceToWallFactor * 1.3f));
+
+            rightHandIK.weight = rightOut * 2;
+            leftHandIK.weight = leftOut * 2;
+
+            Mathf.Clamp01(rightHandIK.weight);
+            Mathf.Clamp01(leftHandIK.weight);
+
+
+            if (Vector3.Distance(rightHandObject.transform.position, rightHandTarget.transform.position) < 0.3f
+                &&
+                Vector3.Distance(leftHandObject.transform.position, leftHandTarget.transform.position) < 0.3f)
+            {
+                handsInPosition = true;
+                minCamYaw = -10f;
+                CanMoveBody = false;
+                CanMoveObjects = false;
+                isMantling = true;
+                mantleCompletionValue = 0.05f;
+                startingPosWhenMantling = transform.position;
+                Debug.Log($"starting climb");
+            }
+        }
+        else
+        {
+            if ((dotValue > -0.9f && dotValue < 0.9f))
+            {
+                if (moveInput.y > 0.1)
+                {
+                    // Lift yourself up
+                    mantleCompletionValue += Time.deltaTime * 0.1f * mantleSpeed * (1 + mantleCompletionValue * 0.5f);
+                }
+                if (moveInput.y < -0.1  )
+                {
+                    // Lower yourself down
+                    mantleCompletionValue -= Time.deltaTime * 0.1f * mantleSpeed * (1 + mantleCompletionValue * 0.5f);
+                }
+                if (mantleCompletionValue >= 0.95f)
+                {
+                    handsInPosition = false;
+                    minCamYaw = -80f;
+                    CanMoveBody = true;
+                    CanMoveObjects = true;
+                    isMantling = false;
+                    Debug.Log($"Mantle Complete!");
+                }
+                if(mantleCompletionValue < 0.05f)
+                {
+                    Vector3 dir = transform.position - mantleAreaObject.transform.position;
+                    transform.position += dir;
+                    Debug.Log($"down on floor, sending back");
+                    isMantling = false;
+                    handsInPosition = false;
+                    minCamYaw = -80f;
+                    CanMoveBody = true;
+                    CanMoveObjects = true;
+                }
+
+                float t = mantleCompletionValue;
+
+                if (t <= 0.7f)
+                {
+                    float segT = t / 0.7f;
+                    transform.position = Vector3.Lerp(startingPosWhenMantling, 
+                        mantleAreaController.ClimbPoint1.transform.position, 
+                        segT);
+                }
+                else if (t <= 0.9f)
+                {
+                    float segT = (t - 0.7f) / (0.2f);
+                    transform.position = Vector3.Lerp(mantleAreaController.ClimbPoint1.transform.position, 
+                        mantleAreaController.ClimbPoint2.transform.position, 
+                        segT);
+                }
+                else
+                {
+                    float segT = (t - 0.9f) / (0.2f);
+                    transform.position = Vector3.Lerp(mantleAreaController.ClimbPoint2.transform.position,
+                        mantleAreaController.ClimbPoint3.transform.position,
+                        segT);
+                }
+            }
+            else
+            {
+                // looking away from the wall, cancel the climb
+                isMantling = false;
+                handsInPosition = false;
+                minCamYaw = -80f;
+                CanMoveBody = true;
+                CanMoveObjects = true;
+            }
+        }
+    }
+
+    private void OnTriggerEnter(Collider other)
+    {
+        if(other.CompareTag("Mantle"))
+        {
+            mantleAreaObject = other.gameObject;
+            mantleAreaController = other.GetComponent<MantleAreaController>();
+        }
+    }
+
+    private void OnTriggerExit(Collider other)
+    {
+        if (other.CompareTag("Mantle"))
+        {
+            mantleAreaObject = null;
+            mantleAreaController = null;
+        }
+    }
+
 }
